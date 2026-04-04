@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -5,160 +7,141 @@ import cv2
 import numpy as np
 
 
+REFERENCE_FILE = "reference_mask_vote_0.50.npy"
+
 _REF_READY = False
-_REF_SMALL: Optional[np.ndarray] = None
-_REF_FULL: Optional[np.ndarray] = None
+_REF_MASK: Optional[np.ndarray] = None
 
 
-def _load_good_reference(image_shape: Tuple[int, int]) -> None:
-    """Build a lightweight grayscale reference model from train/good if available."""
-    global _REF_READY, _REF_SMALL, _REF_FULL
-    if _REF_READY:
-        return
+def _load_reference_mask() -> np.ndarray:
+    global _REF_READY, _REF_MASK
+    if _REF_READY and _REF_MASK is not None:
+        return _REF_MASK
 
-    h, w = image_shape
-    root = Path(__file__).resolve().parent / "transistor" / "train" / "good"
-    if not root.exists():
-        _REF_READY = True
-        return
-
-    files = sorted(root.glob("*.png"))[:80]
-    if not files:
-        _REF_READY = True
-        return
-
-    small_stack = []
-    full_stack = []
-    for file_path in files:
-        bgr = cv2.imread(str(file_path), cv2.IMREAD_COLOR)
-        if bgr is None:
-            continue
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        if rgb.shape[:2] != (h, w):
-            rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        full_stack.append(gray.astype(np.uint8))
-        small_stack.append(cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA))
-
-    if full_stack:
-        _REF_FULL = np.stack(full_stack, axis=0)
-        _REF_SMALL = np.stack(small_stack, axis=0)
-
+    ref_path = Path(__file__).resolve().parent / REFERENCE_FILE
+    ref = np.load(str(ref_path))
+    if ref.dtype != np.uint8:
+        ref = np.clip(ref, 0, 255).astype(np.uint8)
+    _REF_MASK = ref
     _REF_READY = True
+    return _REF_MASK
 
 
-def _foreground_mask(gray: np.ndarray) -> np.ndarray:
-    """Create broad transistor mask to suppress background false positives."""
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, fg = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-    return fg
+def _cleanup_components(mask: np.ndarray, min_area: int = 30) -> np.ndarray:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out = np.zeros_like(mask)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            out[labels == i] = 255
+    return out
 
 
-def _anomaly_map(gray: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Compute anomaly score map and global mismatch score."""
-    gray_f = gray.astype(np.float32)
-
-    if _REF_FULL is not None and _REF_SMALL is not None and _REF_FULL.shape[0] >= 3:
-        small = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA).astype(np.float32)
-        ref_small_f = _REF_SMALL.astype(np.float32)
-        dists = np.mean(np.abs(ref_small_f - small[None, :, :]), axis=(1, 2))
-
-        k = min(5, len(dists))
-        best_idx = np.argpartition(dists, k - 1)[:k]
-        refs = _REF_FULL[best_idx].astype(np.float32)
-
-        ref_median = np.median(refs, axis=0)
-        ref_std = np.std(refs, axis=0)
-
-        diff = np.abs(gray_f - ref_median)
-        grad_img = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
-        grad_ref = cv2.Sobel(ref_median, cv2.CV_32F, 1, 0, ksize=3)
-        grad_diff = np.abs(grad_img - grad_ref)
-
-        score = diff / (ref_std + 6.0) + 0.35 * grad_diff / 32.0
-        global_mismatch = float(np.mean(dists[best_idx]))
-    else:
-        # Fallback when train/good is unavailable: local residual + edge response.
-        smooth = cv2.GaussianBlur(gray_f, (17, 17), 0)
-        residual = np.abs(gray_f - smooth)
-        lap = cv2.Laplacian(gray_f, cv2.CV_32F, ksize=3)
-        score = residual + 0.6 * np.abs(lap)
-        global_mismatch = float(np.mean(residual))
-
-    score = cv2.GaussianBlur(score, (5, 5), 0)
-    return score, global_mismatch
+def _fg_hsv(img_rgb: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    mask = ((s < 85) & (v < 210)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    return _cleanup_components(mask, min_area=40)
 
 
-def _postprocess(binary: np.ndarray, fg: np.ndarray) -> np.ndarray:
-    """Clean mask while preserving very small defects."""
-    mask = cv2.bitwise_and(binary, fg)
+def _remove_border_stripes(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out = np.zeros_like(mask)
 
+    for i in range(1, n):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 40:
+            continue
+
+        touches_border = x <= 1 or y <= 1 or (x + cw) >= (w - 1) or (y + ch) >= (h - 1)
+        aspect = max(cw, ch) / float(min(cw, ch) + 1e-6)
+        long_vertical = ch >= int(0.65 * h) and cw <= int(0.08 * w)
+        if touches_border and long_vertical and aspect > 6.0:
+            continue
+
+        out[labels == i] = 255
+
+    return out
+
+
+def _fill_wire_holes(mask: np.ndarray) -> np.ndarray:
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    flood = mask.copy()
+    h, w = flood.shape
+    flood_aux = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, flood_aux, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
+
+
+def _extract_main_component(mask: np.ndarray, min_area: int = 800) -> np.ndarray:
+    h, w = mask.shape
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n <= 1:
+        return np.zeros_like(mask)
+
+    best_idx = None
+    best_score = -1.0
+    for i in range(1, n):
+        area = float(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        cx, cy = centroids[i]
+        center_penalty = abs(cx - 0.5 * w) / w + abs(cy - 0.45 * h) / h
+        score = area * (1.2 - center_penalty)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    out = np.zeros_like(mask)
+    if best_idx is not None:
+        out[labels == best_idx] = 255
+    return out
+
+
+def _extract_transistor_mask(img_rgb: np.ndarray) -> np.ndarray:
+    mask = _fg_hsv(img_rgb)
+    mask = _remove_border_stripes(mask)
+    mask = _extract_main_component(mask)
+    mask = _fill_wire_holes(mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    return _cleanup_components(mask, min_area=60)
+
+
+def _postprocess_defect(mask: np.ndarray) -> np.ndarray:
+    mask = _cleanup_components(mask, min_area=25)
     area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
-    if area_ratio > 0.20:
-        # For very large anomalies (often misplaced), keep shape coherent.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-    else:
-        # For small defects, avoid aggressive closing that could erase thin damage.
+    if area_ratio > 0.30:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    cleaned = np.zeros_like(mask)
-    min_area = max(20, int(0.00005 * mask.size))
-    for idx in range(1, num_labels):
-        area = stats[idx, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            cleaned[labels == idx] = 255
-
-    return cleaned
+    else:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+    mask = _cleanup_components(mask, min_area=25)
+    return mask.astype(np.uint8)
 
 
 def predict(image: np.ndarray) -> np.ndarray:
-    """Segment transistor defect mask.
-
-    Args:
-        image: RGB image of shape (H, W, 3), dtype uint8.
-
-    Returns:
-        Binary defect mask of shape (H, W), dtype uint8 with values {0, 255}.
-    """
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("Expected RGB image with shape (H, W, 3).")
 
     if image.dtype != np.uint8:
         image = np.clip(image, 0, 255).astype(np.uint8)
 
-    h, w = image.shape[:2]
-    _load_good_reference((h, w))
+    transistor_mask = _extract_transistor_mask(image)
+    reference_mask = _load_reference_mask()
 
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    if reference_mask.shape != transistor_mask.shape:
+        h, w = transistor_mask.shape
+        reference_mask = cv2.resize(reference_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    fg = _foreground_mask(gray)
-    score, global_mismatch = _anomaly_map(gray)
-
-    fg_scores = score[fg > 0]
-    if fg_scores.size == 0:
-        return np.zeros((h, w), dtype=np.uint8)
-
-    # Strong global mismatch is typically a misplaced transistor.
-    if global_mismatch > 15.0:
-        return cv2.morphologyEx(
-            fg, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1
-        ).astype(np.uint8)
-
-    # Weak tail response on anomaly map is usually a false positive on good sample.
-    q99 = float(np.percentile(fg_scores, 99.0))
-    if q99 < 6.0:
-        return np.zeros((h, w), dtype=np.uint8)
-
-    threshold = float(np.percentile(fg_scores, 98.8))
-    binary = (score >= threshold).astype(np.uint8) * 255
-    mask = _postprocess(binary, fg)
-
-    if float(np.count_nonzero(mask)) / float(mask.size) > 0.30:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-
-    return mask.astype(np.uint8)
+    diff = cv2.bitwise_xor(transistor_mask, reference_mask)
+    support = cv2.bitwise_or(transistor_mask, reference_mask)
+    support = cv2.dilate(support, np.ones((9, 9), np.uint8), iterations=1)
+    diff = cv2.bitwise_and(diff, support)
+    return _postprocess_defect(diff)
