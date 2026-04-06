@@ -1,0 +1,9 @@
+best_min_defect_area_px=30
+tp=0.0
+fp=7.0
+tn=70.0
+fn=9.0
+precision=0.0
+recall=0.0
+f1=0.0
+accuracy=0.813953488372093
