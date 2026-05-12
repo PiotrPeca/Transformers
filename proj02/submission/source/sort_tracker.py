@@ -9,9 +9,9 @@ from scipy.optimize import linear_sum_assignment
 # Configuration (can be overridden by CLI arguments)
 SEQUENCE_NAME = "MOT_07"
 DATASET_SPLIT = "test"  # "train" or "test"
-MIN_CONFIDENCE = 0.0
-MIN_IOU = 0.3
-MAX_AGE = 3
+MIN_CONFIDENCE = 0.4
+MIN_IOU = 0.15
+MAX_AGE = 15
 
 
 def iou_batch(bboxes1, bboxes2):
