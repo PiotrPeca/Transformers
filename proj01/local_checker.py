@@ -65,6 +65,7 @@ def evaluate_competition_iou(project_dir: Path) -> Dict[str, float]:
         print(f"True {tc:12s} -> {preds_str}")
 
     summary = {}
+    impact_rows = []
     print("\n--- Summary (competition IoU) ---")
     for cls_name in CLASSES:
         arr = np.array(per_class[cls_name], dtype=np.float32)
@@ -72,8 +73,30 @@ def evaluate_competition_iou(project_dir: Path) -> Dict[str, float]:
         summary[f"comp_iou_{cls_name}"] = mean_value
         print(f"{cls_name:12s} mean={mean_value:.6f} n={arr.size}")
 
+        if arr.size:
+            # Weighted impact on overall error: how much this class lowers final score.
+            class_error = float((1.0 - arr).mean())
+            weighted_error = class_error * float(arr.size / max(len(all_scores), 1))
+            impact_rows.append((cls_name, weighted_error, class_error, int(arr.size)))
+        else:
+            impact_rows.append((cls_name, 0.0, 0.0, 0))
+
     overall = np.array(all_scores, dtype=np.float32).mean()
     print(f"overall      mean={overall:.6f}")
+
+    total_error = max(0.0, 1.0 - float(overall))
+    print("\n--- Class Impact On Final Result ---")
+    print("(im wyzszy impact_pp, tym bardziej dana klasa psuje wynik koncowy)")
+    for cls_name, weighted_error, class_error, n_items in sorted(impact_rows, key=lambda x: x[1], reverse=True):
+        share_pct = (100.0 * weighted_error / total_error) if total_error > 1e-12 else 0.0
+        impact_pp = 100.0 * weighted_error
+        summary[f"impact_pp_{cls_name}"] = impact_pp
+        summary[f"impact_share_pct_{cls_name}"] = share_pct
+        print(
+            f"{cls_name:12s} impact_pp={impact_pp:6.2f} "
+            f"share={share_pct:6.2f}% class_error={class_error:.6f} n={n_items}"
+        )
+
     return summary
 
 def main():

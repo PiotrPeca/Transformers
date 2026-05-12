@@ -10,6 +10,16 @@ import numpy as np
 REFERENCE_FILE = "reference_mask_vote_0.50.npy"
 DEFAULT_DISTANCE_THRESHOLD_PX = 108
 DEFAULT_MIN_TRANSISTOR_AREA_RATIO = 0.10
+DEFAULT_DAMAGED_CASE_TOP_RATIO = 0.55
+DEFAULT_DAMAGED_CASE_CENTER_WIDTH_RATIO = 0.62
+DEFAULT_DAMAGED_CASE_TOP_IGNORE_RATIO = 0.30
+DEFAULT_DAMAGED_CASE_DARK_THRESHOLD = 60
+DEFAULT_DAMAGED_CASE_BRIGHTNESS_THRESHOLD = 120
+DEFAULT_DAMAGED_CASE_MIN_DAMAGE_AREA = 320
+DEFAULT_DAMAGED_CASE_SAFE_EROSION_ITERATIONS = 1
+DEFAULT_DAMAGED_CASE_USE_BRIGHTNESS_BLUR = True
+DEFAULT_DAMAGED_CASE_BRIGHTNESS_BLUR_TYPE = "median"
+DEFAULT_DAMAGED_CASE_BRIGHTNESS_BLUR_KERNEL = 3
 DEFAULT_CUT_LEAD_ZONE_START = 0.68
 DEFAULT_CUT_LEAD_EROSION_ITERATIONS = 4
 DEFAULT_CUT_LEAD_MIN_ZONE_DEFECT_AREA = 3000
@@ -293,10 +303,233 @@ def _build_misplaced_mask(debug: dict, fallback_shape: Tuple[int, int]) -> np.nd
         h, w = test_mask.shape
         ref_mask = cv2.resize(ref_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    misplaced_mask = cv2.bitwise_xor(ref_mask, test_mask)
+    misplaced_mask = cv2.bitwise_or(ref_mask, test_mask)
+    # Build a solid silhouette for visualization and IoU with filled interior.
+    misplaced_mask = cv2.morphologyEx(
+        misplaced_mask,
+        cv2.MORPH_CLOSE,
+        np.ones((9, 9), np.uint8),
+        iterations=2,
+    )
+    misplaced_mask = _fill_wire_holes(misplaced_mask)
+    misplaced_mask = cv2.dilate(misplaced_mask, np.ones((5, 5), np.uint8), iterations=1)
+    misplaced_mask = _cleanup_components(misplaced_mask, min_area=60)
     if np.count_nonzero(misplaced_mask) == 0:
         misplaced_mask = ref_mask.copy()
     return misplaced_mask
+
+
+def _keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    binary = _ensure_binary_mask(mask)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n_labels <= 1:
+        return binary
+
+    largest_idx = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
+    out = np.zeros_like(binary)
+    out[labels == largest_idx] = 255
+    return out
+
+
+def _get_aligned_mask(test_mask: np.ndarray, ref_mask: np.ndarray) -> np.ndarray:
+    test_bin = _ensure_binary_mask(test_mask)
+    ref_bin = _ensure_binary_mask(ref_mask)
+
+    m_ref = cv2.moments(ref_bin)
+    m_test = cv2.moments(test_bin)
+    if m_ref["m00"] == 0 or m_test["m00"] == 0:
+        return test_bin
+
+    dx = int(m_ref["m10"] / m_ref["m00"] - m_test["m10"] / m_test["m00"])
+    dy = int(m_ref["m01"] / m_ref["m00"] - m_test["m01"] / m_test["m00"])
+    h, w = test_bin.shape
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(test_bin, M, (w, h), flags=cv2.INTER_NEAREST)
+
+
+def _extract_mask_for_damaged_case(img_rgb: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    _, mask = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    return _keep_largest_component(mask)
+
+
+def _get_case_only_mask(
+    full_mask: np.ndarray,
+    top_ratio: float = DEFAULT_DAMAGED_CASE_TOP_RATIO,
+    center_width_ratio: float = DEFAULT_DAMAGED_CASE_CENTER_WIDTH_RATIO,
+) -> np.ndarray:
+    mask = _ensure_binary_mask(full_mask)
+    y_coords, _ = np.where(mask > 0)
+    if y_coords.size == 0:
+        return mask
+
+    y_min = int(y_coords.min())
+    y_max = int(y_coords.max())
+    height = y_max - y_min
+    case_bottom_y = y_min + int(height * float(top_ratio))
+
+    case_only = np.zeros_like(mask)
+    case_only[y_min:case_bottom_y, :] = mask[y_min:case_bottom_y, :]
+    case_only = _keep_largest_component(case_only)
+
+    x_coords = np.where(case_only > 0)[1]
+    if x_coords.size == 0:
+        return case_only
+
+    x_min = int(x_coords.min())
+    x_max = int(x_coords.max())
+    width = x_max - x_min + 1
+    trim = int(width * (1.0 - float(center_width_ratio)) / 2.0)
+    left = x_min + trim
+    right = x_max - trim
+
+    centered = np.zeros_like(case_only)
+    centered[:, left : right + 1] = case_only[:, left : right + 1]
+    return _keep_largest_component(centered)
+
+
+def _get_dark_case_mask(
+    img_rgb: np.ndarray,
+    case_region_mask: np.ndarray,
+    dark_threshold: int = DEFAULT_DAMAGED_CASE_DARK_THRESHOLD,
+) -> np.ndarray:
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    _, dark_pixels = cv2.threshold(gray, int(dark_threshold), 255, cv2.THRESH_BINARY_INV)
+    dark_case = cv2.bitwise_and(dark_pixels, _ensure_binary_mask(case_region_mask))
+    kernel = np.ones((3, 3), np.uint8)
+    dark_case = cv2.morphologyEx(dark_case, cv2.MORPH_OPEN, kernel, iterations=1)
+    dark_case = cv2.morphologyEx(dark_case, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return dark_case
+
+
+def is_damaged_case(
+    image: np.ndarray,
+    reference_mask: np.ndarray | None = None,
+    case_top_ratio: float = DEFAULT_DAMAGED_CASE_TOP_RATIO,
+    case_center_width_ratio: float = DEFAULT_DAMAGED_CASE_CENTER_WIDTH_RATIO,
+    top_ignore_ratio: float = DEFAULT_DAMAGED_CASE_TOP_IGNORE_RATIO,
+    dark_case_threshold: int = DEFAULT_DAMAGED_CASE_DARK_THRESHOLD,
+    brightness_threshold: int = DEFAULT_DAMAGED_CASE_BRIGHTNESS_THRESHOLD,
+    min_damage_area: int = DEFAULT_DAMAGED_CASE_MIN_DAMAGE_AREA,
+    safe_erosion_iterations: int = DEFAULT_DAMAGED_CASE_SAFE_EROSION_ITERATIONS,
+    use_brightness_blur: bool = DEFAULT_DAMAGED_CASE_USE_BRIGHTNESS_BLUR,
+    brightness_blur_type: str = DEFAULT_DAMAGED_CASE_BRIGHTNESS_BLUR_TYPE,
+    brightness_blur_kernel: int = DEFAULT_DAMAGED_CASE_BRIGHTNESS_BLUR_KERNEL,
+    precomputed_test_mask: np.ndarray | None = None,
+    return_debug: bool = False,
+) -> bool | tuple[bool, dict]:
+    if not isinstance(image, np.ndarray):
+        raise TypeError("image musi byc typu np.ndarray")
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image musi miec ksztalt (H, W, 3)")
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    if not (0.0 < float(case_top_ratio) < 1.0):
+        raise ValueError("case_top_ratio musi byc w zakresie (0, 1)")
+    if not (0.0 < float(case_center_width_ratio) <= 1.0):
+        raise ValueError("case_center_width_ratio musi byc w zakresie (0, 1]")
+    if not (0.0 <= float(top_ignore_ratio) < 1.0):
+        raise ValueError("top_ignore_ratio musi byc w zakresie [0, 1)")
+    if int(min_damage_area) < 0:
+        raise ValueError("min_damage_area musi byc >= 0")
+    if int(safe_erosion_iterations) < 0:
+        raise ValueError("safe_erosion_iterations musi byc >= 0")
+
+    ref_mask = _load_reference_mask() if reference_mask is None else _ensure_binary_mask(reference_mask)
+
+    h_img, w_img = image.shape[:2]
+    if ref_mask.shape != (h_img, w_img):
+        ref_mask = cv2.resize(ref_mask, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    gray_for_brightness = gray
+    if use_brightness_blur:
+        k = max(1, int(brightness_blur_kernel))
+        if k % 2 == 0:
+            k += 1
+        if brightness_blur_type == "gaussian":
+            gray_for_brightness = cv2.GaussianBlur(gray_for_brightness, (k, k), 0)
+        else:
+            gray_for_brightness = cv2.medianBlur(gray_for_brightness, k)
+
+    ref_mask_clean = _keep_largest_component(ref_mask)
+    ref_case_region = _get_case_only_mask(
+        ref_mask_clean,
+        top_ratio=float(case_top_ratio),
+        center_width_ratio=float(case_center_width_ratio),
+    )
+
+    if precomputed_test_mask is None:
+        test_mask_full = _extract_mask_for_damaged_case(image)
+    else:
+        test_mask_full = _ensure_binary_mask(precomputed_test_mask)
+        if test_mask_full.shape != ref_mask_clean.shape:
+            h_ref, w_ref = ref_mask_clean.shape
+            test_mask_full = cv2.resize(test_mask_full, (w_ref, h_ref), interpolation=cv2.INTER_NEAREST)
+
+    test_mask_aligned = _get_aligned_mask(test_mask_full, ref_mask_clean)
+    test_case_region = cv2.bitwise_and(test_mask_aligned, ref_case_region)
+
+    dark_case_mask = _get_dark_case_mask(
+        image,
+        ref_case_region,
+        dark_threshold=int(dark_case_threshold),
+    )
+    analysis_case_mask = cv2.bitwise_and(test_case_region, dark_case_mask)
+
+    y_coords = np.where(ref_case_region > 0)[0]
+    valid_region_mask = ref_case_region.copy()
+    if y_coords.size > 0:
+        y_min = int(y_coords.min())
+        y_max = int(y_coords.max())
+        case_height = y_max - y_min + 1
+        top_ignore_h = int(case_height * float(top_ignore_ratio))
+        if top_ignore_h > 0:
+            valid_region_mask[y_min : y_min + top_ignore_h, :] = 0
+
+    shape_base_ref = cv2.bitwise_and(ref_case_region, valid_region_mask)
+    shape_base_test = cv2.bitwise_and(test_case_region, valid_region_mask)
+    shape_defect = cv2.subtract(shape_base_ref, shape_base_test)
+
+    kernel_safe = np.ones((5, 5), np.uint8)
+    safe_zone = cv2.erode(analysis_case_mask, kernel_safe, iterations=int(safe_erosion_iterations))
+    safe_zone = cv2.bitwise_and(safe_zone, valid_region_mask)
+
+    _, bright_parts = cv2.threshold(
+        gray_for_brightness,
+        int(brightness_threshold),
+        255,
+        cv2.THRESH_BINARY,
+    )
+    brightness_defect = cv2.bitwise_and(bright_parts, safe_zone)
+
+    combined_defect = cv2.bitwise_or(shape_defect, brightness_defect)
+    combined_defect = cv2.bitwise_and(combined_defect, valid_region_mask)
+    combined_defect = cv2.morphologyEx(
+        combined_defect,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+    )
+
+    defect_area = int(np.count_nonzero(combined_defect))
+    decision = defect_area > int(min_damage_area)
+
+    if not return_debug:
+        return decision
+
+    debug = {
+        "is_defective": bool(decision),
+        "defect_area": defect_area,
+        "threshold_area": int(min_damage_area),
+        "defect_mask": combined_defect,
+        "ref_case_region": ref_case_region,
+        "analysis_case_mask": analysis_case_mask,
+        "test_mask_aligned": test_mask_aligned,
+        "valid_region_mask": valid_region_mask,
+    }
+    return decision, debug
 
 
 def is_cut_lead(
@@ -429,11 +662,12 @@ def is_cut_lead(
 
 
 def predict(image: np.ndarray) -> Tuple[np.ndarray, str]:
+    ref_mask = _load_reference_mask()
     decision, debug = is_misplased_with_presence_check(
         image=image,
         distance_threshold_px=DEFAULT_DISTANCE_THRESHOLD_PX,
         min_area_ratio=DEFAULT_MIN_TRANSISTOR_AREA_RATIO,
-        reference_mask=_load_reference_mask(),
+        reference_mask=ref_mask,
         return_debug=True,
     )
 
@@ -441,6 +675,7 @@ def predict(image: np.ndarray) -> Tuple[np.ndarray, str]:
     if decision:
         return _build_misplaced_mask(debug, fallback_shape=(h, w)), "misplaced"
 
+    # Tryb 2-klasowy: tylko misplaced i good.
     return np.zeros((h, w), dtype=np.uint8), "good"
 
 
